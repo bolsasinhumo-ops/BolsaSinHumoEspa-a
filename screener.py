@@ -54,7 +54,7 @@ RULES_FINANCIALS = {
 }
 
 MAX_ALERTS_PER_RUN = 8       # máximo de avisos por ejecución
-REALERT_AFTER_DAYS = 30      # vuelve a avisar de la misma empresa pasados estos días...
+REALERT_AFTER_DAYS = 0      # vuelve a avisar de la misma empresa pasados estos días...
 REALERT_IF_WORSE_BY = 0.10   # ...o si ha caído 10 puntos más desde el último aviso
 
 # Universo: valores españoles en Yahoo Finance (sufijo .MC = Bolsa de Madrid).
