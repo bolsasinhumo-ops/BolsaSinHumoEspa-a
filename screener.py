@@ -7,7 +7,8 @@ Cada ejecución manda UN mensaje con:
   🟡 LAS 5 MÁS CERCA -> no cumplen, pero son las que menos les falta
 
 Uso:
-  python screener.py                                  # normal: envía a Telegram
+  python screener.py                                  # normal: mercado según el día (lun España, mar Europa, mié EE. UU.)
+  python screener.py --market us                      # fuerza un mercado: es, eu o us
   python screener.py --dry-run                        # solo imprime, no envía ni guarda
   python screener.py --test                           # manda un mensaje de prueba
   python screener.py --tickers ITX.MC,IDR.MC --dry-run
@@ -17,6 +18,7 @@ Variables de entorno necesarias para enviar:
 """
 import argparse
 import html
+import io
 import json
 import os
 import re
@@ -55,8 +57,15 @@ RULES_FINANCIALS = {
 }
 
 TOP_NEAR = 5                # cuántas "que no cumplen pero están cerca" se muestran
-REVIEW_MIN_DRAWDOWN = 0.10  # solo se revisan valores con al menos esta caída...
-MAX_REVIEW = 80             # ...y como mucho los N que más han caído (al ser semanal, hay tiempo de sobra)
+# Ajustes por mercado. En cada uno solo se revisan los fundamentales de las empresas que han
+# caído al menos "review_min_drawdown", y como mucho las "max_review" que más han caído.
+MARKETS = {
+    "es": {"name": "España", "review_min_drawdown": 0.10, "max_review": 80},
+    "eu": {"name": "Europa", "review_min_drawdown": 0.20, "max_review": 100},
+    "us": {"name": "EE. UU.", "review_min_drawdown": 0.25, "max_review": 150},
+}
+# Qué mercado se ejecuta cada día (0 = lunes ... 6 = domingo; hora UTC). Máximo el miércoles.
+AUTO_SCHEDULE = {0: "es", 1: "eu", 2: "us"}
 MAX_CUMPLE = 10             # máximo de empresas que cumplen listadas en el mensaje (el resto: "y N más")
 SHOW_EXTRA = True           # en los que cumplen: recompras y activo circulante neto
 REPEAT_ALERTS = True        # True = avisa cada ejecución aunque ya lo hubiera avisado antes
@@ -87,8 +96,80 @@ SPAIN_TICKERS = [
     "VOC.MC",
 ]
 
-# Valores extra que quieras añadir (mismo formato). Ejemplo: "CAF.MC"
-EXTRA_TICKERS = []
+# Valores extra que quieras añadir a cada mercado (mismo formato de Yahoo). Ejemplo: "CAF.MC"
+EXTRA_TICKERS = []      # España
+EXTRA_TICKERS_EU = []   # Europa
+EXTRA_TICKERS_US = []   # EE. UU. (además del S&P 500, que se baja de Wikipedia al ejecutarse)
+
+# Plan B de EE. UU.: si no se puede bajar el S&P 500 de Wikipedia, se revisa esta lista corta.
+US_FALLBACK = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AVGO", "ORCL", "CRM", "ADBE", "ACN", "IBM",
+    "INTC", "AMD", "QCOM", "TXN", "CSCO", "NOW", "INTU", "AMAT", "MU", "PYPL", "EBAY", "NFLX", "DIS",
+    "CMCSA", "T", "VZ", "TMUS", "CHTR", "WBD", "PARA", "NKE", "SBUX", "MCD", "HD", "LOW", "TGT", "WMT",
+    "COST", "DG", "DLTR", "KR", "ROST", "TJX", "LULU", "EL", "PG", "KO", "PEP", "PM", "MO", "CL", "KMB",
+    "GIS", "KHC", "MDLZ", "HSY", "CPB", "SJM", "JNJ", "PFE", "MRK", "ABBV", "LLY", "BMY", "AMGN", "GILD",
+    "BIIB", "REGN", "VRTX", "MRNA", "UNH", "CVS", "CI", "HUM", "ELV", "CNC", "MDT", "ABT", "TMO", "DHR",
+    "ISRG", "SYK", "BSX", "EW", "ZBH", "BAX", "JPM", "BAC", "WFC", "C", "GS", "MS", "SCHW", "BLK", "AXP",
+    "COF", "USB", "PNC", "TFC", "MET", "PRU", "AIG", "ALL", "TRV", "CB", "V", "MA", "XOM", "CVX", "COP",
+    "OXY", "SLB", "EOG", "MPC", "VLO", "PSX", "KMI", "WMB", "CAT", "DE", "BA", "LMT", "RTX", "GE", "HON",
+    "MMM", "UPS", "FDX", "UNP", "CSX", "NSC", "LUV", "DAL", "UAL", "F", "GM", "DOW", "DD", "LYB", "NEM",
+    "FCX", "NUE", "NEE", "DUK", "SO", "D", "AEP", "EXC", "PLD", "AMT", "CCI", "SPG", "O", "PSA", "WELL",
+    "EQIX", "KVUE", "ZTS", "TEAM", "WDAY", "ADSK", "FTNT", "PANW", "CRWD", "SNPS", "CDNS", "KLAC", "LRCX",
+    "ADI", "NXPI", "ON", "MCHP", "SWKS", "QRVO", "EPAM", "CTSH", "GPN", "FIS", "FI", "ADP", "PAYX",
+]
+
+# Europa (sin España): principales valores de Francia, Alemania, Países Bajos, Italia, Bélgica,
+# Finlandia, Suecia, Dinamarca, Noruega, Suiza, Reino Unido, Irlanda, Portugal y Austria.
+# Lista de memoria: lo que Yahoo no reconozca saldrá en el log como "sin datos de precio".
+EUROPE_TICKERS = [
+    # Francia
+    "AIR.PA", "MC.PA", "OR.PA", "RMS.PA", "KER.PA", "TTE.PA", "SAN.PA", "AI.PA", "BNP.PA", "GLE.PA",
+    "ACA.PA", "CS.PA", "SU.PA", "SAF.PA", "DG.PA", "EL.PA", "CAP.PA", "BN.PA", "RI.PA", "STLAP.PA",
+    "ENGI.PA", "ORA.PA", "PUB.PA", "DSY.PA", "STMPA.PA", "HO.PA", "SGO.PA", "ML.PA", "RNO.PA",
+    "VIE.PA", "LR.PA", "TEP.PA", "EDEN.PA", "SW.PA", "CA.PA", "BVI.PA", "AC.PA", "ALO.PA", "AM.PA",
+    "FGR.PA", "VIV.PA",
+    # Alemania
+    "SAP.DE", "SIE.DE", "ALV.DE", "DTE.DE", "MUV2.DE", "BAS.DE", "BAYN.DE", "BMW.DE", "MBG.DE",
+    "VOW3.DE", "PAH3.DE", "P911.DE", "DBK.DE", "CBK.DE", "ADS.DE", "IFX.DE", "DHL.DE", "RWE.DE",
+    "EOAN.DE", "HEN3.DE", "BEI.DE", "MRK.DE", "FRE.DE", "FME.DE", "SHL.DE", "ZAL.DE", "HEI.DE",
+    "CON.DE", "DB1.DE", "SY1.DE", "QIA.DE", "HNR1.DE", "LHA.DE", "VNA.DE", "PUM.DE", "BOSS.DE",
+    "TKA.DE", "ENR.DE", "HFG.DE", "RHM.DE", "MTX.DE", "LIN.DE",
+    # Países Bajos
+    "ASML.AS", "INGA.AS", "AD.AS", "PHIA.AS", "HEIA.AS", "PRX.AS", "WKL.AS", "AKZA.AS", "DSFIR.AS",
+    "ADYEN.AS", "RAND.AS", "NN.AS", "ASM.AS", "BESI.AS", "IMCD.AS", "UMG.AS", "ABN.AS",
+    # Italia
+    "ENEL.MI", "ENI.MI", "ISP.MI", "UCG.MI", "G.MI", "RACE.MI", "TIT.MI", "PRY.MI", "BMPS.MI",
+    "BPE.MI", "MONC.MI", "LDO.MI", "SRG.MI", "TRN.MI", "AMP.MI", "DIA.MI", "REC.MI", "PIRC.MI",
+    "BAMI.MI", "A2A.MI", "HER.MI", "IG.MI", "NEXI.MI", "INW.MI", "BC.MI",
+    # Bélgica
+    "ABI.BR", "KBC.BR", "UCB.BR", "SOLB.BR", "UMI.BR", "ACKB.BR", "GBLB.BR", "AGS.BR", "ARGX.BR",
+    # Finlandia
+    "NOKIA.HE", "NESTE.HE", "SAMPO.HE", "KNEBV.HE", "UPM.HE", "STERV.HE", "FORTUM.HE", "ELISA.HE",
+    "WRT1V.HE", "ORNBV.HE", "NDA-FI.HE",
+    # Suecia
+    "VOLV-B.ST", "ERIC-B.ST", "ATCO-A.ST", "ASSA-B.ST", "SEB-A.ST", "SWED-A.ST", "HM-B.ST",
+    "INVE-B.ST", "SAND.ST", "ESSITY-B.ST", "SHB-A.ST", "TELIA.ST", "ALFA.ST", "EVO.ST", "HEXA-B.ST",
+    "NIBE-B.ST", "SKF-B.ST", "EQT.ST", "BOL.ST",
+    # Dinamarca
+    "NOVO-B.CO", "DSV.CO", "MAERSK-B.CO", "VWS.CO", "ORSTED.CO", "CARL-B.CO", "PNDORA.CO",
+    "COLO-B.CO", "DANSKE.CO", "GMAB.CO", "TRYG.CO", "NSIS-B.CO", "DEMANT.CO", "GN.CO", "ISS.CO",
+    # Noruega
+    "EQNR.OL", "DNB.OL", "MOWI.OL", "TEL.OL", "YAR.OL", "ORK.OL", "SALM.OL", "AKRBP.OL", "NHY.OL",
+    "STB.OL",
+    # Suiza
+    "NESN.SW", "NOVN.SW", "ROG.SW", "UBSG.SW", "ZURN.SW", "ABBN.SW", "CFR.SW", "SREN.SW", "GIVN.SW",
+    "LONN.SW", "SIKA.SW", "ALC.SW", "HOLN.SW", "GEBN.SW", "SLHN.SW", "PGHN.SW", "SCMN.SW", "LOGN.SW",
+    "KNIN.SW", "UHR.SW", "SOON.SW", "BAER.SW", "STMN.SW", "TEMN.SW", "SGSN.SW", "CLN.SW",
+    # Reino Unido
+    "SHEL.L", "AZN.L", "HSBA.L", "ULVR.L", "BP.L", "GSK.L", "RIO.L", "DGE.L", "BATS.L", "REL.L",
+    "LSEG.L", "NG.L", "BARC.L", "LLOY.L", "NWG.L", "VOD.L", "GLEN.L", "AAL.L", "BA.L", "RR.L",
+    "CPG.L", "PRU.L", "AV.L", "LGEN.L", "STAN.L", "TSCO.L", "SSE.L", "IMB.L", "EXPN.L", "ABF.L",
+    "WPP.L", "BT-A.L", "NXT.L", "JD.L", "KGF.L", "MKS.L", "SBRY.L", "OCDO.L", "ITV.L", "INF.L",
+    "ANTO.L", "SGE.L", "AHT.L", "RKT.L", "HLMA.L", "SPX.L", "SMIN.L",
+    # Irlanda, Portugal y Austria
+    "RYA.IR", "KRZ.IR", "BIRG.IR", "EDP.LS", "GALP.LS", "JMT.LS", "BCP.LS", "EDPR.LS",
+    "OMV.VI", "EBS.VI", "VER.VI", "VOE.VI", "ANDR.VI", "RBI.VI",
+]
 
 # Nombres cortos para el mensaje (Yahoo los da en mayúsculas y larguísimos).
 TICKER_NAMES = {
@@ -133,7 +214,35 @@ FUND_KEYS = [
 # ----------------------------------------------------------------------------
 # Datos
 # ----------------------------------------------------------------------------
-def get_universe():
+def market_for_weekday(weekday):
+    return AUTO_SCHEDULE.get(weekday, "es")
+
+
+def sp500_tickers():
+    """Lista del S&P 500 desde Wikipedia (necesita lxml). Lanza error si no se puede bajar."""
+    resp = requests.get(
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+        headers={"User-Agent": "Mozilla/5.0 (compatible; screener-bot/1.0; personal use)"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    table = pd.read_html(io.StringIO(resp.text))[0]
+    out = [str(s).strip().replace(".", "-") for s in table["Symbol"]]
+    if len(out) < 400:
+        raise ValueError(f"la tabla del S&P 500 trae solo {len(out)} filas")
+    return out
+
+
+def get_universe(market="es"):
+    if market == "eu":
+        return sorted(set(EUROPE_TICKERS + EXTRA_TICKERS_EU))
+    if market == "us":
+        try:
+            base = sp500_tickers()
+        except Exception as e:
+            print(f"[aviso] no pude bajar el S&P 500 ({e}); uso la lista corta de reserva")
+            base = US_FALLBACK
+        return sorted(set(base + EXTRA_TICKERS_US))
     return sorted(set(SPAIN_TICKERS + EXTRA_TICKERS))
 
 
@@ -231,13 +340,30 @@ def _m(v, cur=""):
     return f"{v / 1e6:.0f}M{sym}"
 
 
+_SUFFIX = re.compile(
+    r"[,\s]+(S\.?A\.?U?\.?|S\.?L\.?|PLC|SE|N\.?V\.?|INC\.?|CORP\.?|CORPORATION|LTD\.?|LIMITED|AG|"
+    r"S\.?P\.?A\.?|A/S|AB|ASA|OYJ|CO\.?|COMPANY|HOLDINGS?)\.?$",
+    re.I,
+)
+
+
 def _name(t, f):
     if t in TICKER_NAMES:
         return TICKER_NAMES[t]
     raw = str(f.get("name") or t).strip()
-    raw = re.sub(r"[,\s]+(S\.?A\.?U?\.?|S\.?L\.?|PLC|SE|N\.?V\.?)\.?$", "", raw, flags=re.I)
-    raw = raw.title()
+    for _ in range(3):  # quita sufijos legales: S.A., Inc., PLC, AG...
+        new = _SUFFIX.sub("", raw)
+        if new == raw or not new:
+            break
+        raw = new
+    if raw.isupper() and " " in raw:  # "BNP PARIBAS" -> "Bnp Paribas"; siglas sueltas (SAP, ASML) se dejan
+        raw = raw.title()
     return raw if len(raw) <= 22 else raw[:21].rstrip() + "…"
+
+
+def _tk(t):
+    """Ticker para mostrar, sin el sufijo de bolsa: SAP.DE -> SAP."""
+    return t.split(".")[0]
 
 
 # ----------------------------------------------------------------------------
@@ -399,10 +525,10 @@ def extras(t, stat, f):
 # ----------------------------------------------------------------------------
 def _head(r):
     t, s, f = r["t"], r["stat"], r["f"]
-    short = html.escape(t.replace(".MC", ""))
+    short = html.escape(_tk(t))
     yahoo = f'<a href="https://finance.yahoo.com/quote/{html.escape(t)}">Yahoo</a>'
     name = _name(t, f)
-    label = f"<b>{html.escape(name)}</b>" + ("" if name.upper() == t.replace(".MC", "") else f" ({short})")
+    label = f"<b>{html.escape(name)}</b>" + ("" if name.upper() == _tk(t) else f" ({short})")
     return f"• {label} · cae {abs(s['drawdown']) * 100:.0f}% · {yahoo}"
 
 
@@ -444,9 +570,10 @@ def _fit(lines, limit=3900):
     return "\n".join(out)
 
 
-def build_report(cumple, near, n_review, no_data=0, n_total=0, cumple_more=0):
+def build_report(cumple, near, n_review, no_data=0, n_total=0, cumple_more=0, market=""):
     cover = f" · {n_total} empresas revisadas" if n_total else ""
-    L = [f"📉 <b>Calidad en caída · {date.today():%d/%m}</b>",
+    where = f" · {market}" if market else ""
+    L = [f"📉 <b>Calidad en caída{where} · {date.today():%d/%m}</b>",
          f"<i>Caída desde el máximo de 12 meses{cover}</i>"]
     L += ["", f"✅ <b>CUMPLEN LAS PAUTAS</b>"]
     if cumple:
@@ -516,7 +643,9 @@ def main():
     ap = argparse.ArgumentParser(description="Calidad en caída -> Telegram")
     ap.add_argument("--dry-run", action="store_true", help="solo imprime, no envía ni guarda")
     ap.add_argument("--test", action="store_true", help="envía un mensaje de prueba")
-    ap.add_argument("--tickers", default="", help="lista separada por comas (por defecto: valores de España)")
+    ap.add_argument("--tickers", default="", help="lista separada por comas (por defecto: el mercado elegido)")
+    ap.add_argument("--market", default="auto", choices=["auto", "es", "eu", "us"],
+                    help="mercado a revisar; 'auto' elige según el día (lun=España, mar=Europa, mié=EE. UU.)")
     args = ap.parse_args()
 
     if args.test:
@@ -524,7 +653,24 @@ def main():
         print("Mensaje de prueba enviado.")
         return
 
-    tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()] or get_universe()
+    market = args.market
+    if market == "auto":
+        market = market_for_weekday(date.today().weekday())
+    cfg = MARKETS[market]
+    print(f"Mercado: {cfg['name']}")
+
+    custom = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
+    if custom:
+        tickers = custom
+    else:
+        try:
+            tickers = get_universe(market)
+        except Exception as e:
+            msg = f"No pude bajar la lista de empresas de {cfg['name']}: {e}"
+            print(f"[error] {msg}")
+            if not args.dry_run:
+                send(f"⚠️ {html.escape(msg)}")
+            return
     print(f"Analizando {len(tickers)} valores...")
 
     stats = price_stats(tickers)
@@ -532,12 +678,13 @@ def main():
     if missing:
         print(f"[aviso] sin datos de precio para {len(missing)}: {', '.join(missing)}")
 
+    min_dd, max_review = cfg["review_min_drawdown"], cfg["max_review"]
     fallen = sorted(
-        ((t, s) for t, s in stats.items() if s["drawdown"] <= -REVIEW_MIN_DRAWDOWN),
+        ((t, s) for t, s in stats.items() if s["drawdown"] <= -min_dd),
         key=lambda ts: ts[1]["drawdown"],
     )
-    review = fallen[:MAX_REVIEW]
-    print(f"{len(fallen)} con caída >= {REVIEW_MIN_DRAWDOWN:.0%}; reviso las {len(review)} que más han caído")
+    review = fallen[:max_review]
+    print(f"{len(fallen)} con caída >= {min_dd:.0%}; reviso las {len(review)} que más han caído")
 
     rows, no_data = [], 0
     for t, s in review:
@@ -570,7 +717,8 @@ def main():
             r["extra"] = extras(r["t"], r["stat"], r["f"])
 
     warn = no_data if (rows and no_data * 2 >= len(rows)) else 0
-    text = build_report(cumple, near, len(rows), warn, len(stats), cumple_more)
+    text = build_report(cumple, near, len(rows), warn, len(stats), cumple_more,
+                        market=cfg["name"] if not custom else "")
 
     if args.dry_run:
         print("\n" + text)
