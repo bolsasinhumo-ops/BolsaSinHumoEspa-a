@@ -56,7 +56,8 @@ RULES_FINANCIALS = {
 
 TOP_NEAR = 5                # cuántas "que no cumplen pero están cerca" se muestran
 REVIEW_MIN_DRAWDOWN = 0.10  # solo se revisan valores con al menos esta caída...
-MAX_REVIEW = 25             # ...y como mucho los N que más han caído (para no saturar a Yahoo)
+MAX_REVIEW = 80             # ...y como mucho los N que más han caído (al ser semanal, hay tiempo de sobra)
+MAX_CUMPLE = 10             # máximo de empresas que cumplen listadas en el mensaje (el resto: "y N más")
 SHOW_EXTRA = True           # en los que cumplen: recompras y activo circulante neto
 REPEAT_ALERTS = True        # True = avisa cada ejecución aunque ya lo hubiera avisado antes
 REALERT_AFTER_DAYS = 30     # (solo si REPEAT_ALERTS = False) repite pasados estos días...
@@ -78,6 +79,12 @@ SPAIN_TICKERS = [
     "EBRO.MC", "ECR.MC", "ENC.MC", "ENO.MC", "FAE.MC", "GCO.MC", "GEST.MC",
     "GRE.MC", "HOME.MC", "PSG.MC", "RJF.MC", "SOL.MC", "TLGO.MC", "TUB.MC",
     "VID.MC", "VIS.MC", "ZOT.MC",
+    # Más del Mercado Continuo
+    "ADZ.MC", "AMP.MC", "ARM.MC", "AZK.MC", "CAF.MC", "CBAV.MC", "CIRSA.MC",
+    "DIA.MC", "EDR.MC", "ENER.MC", "GSJ.MC", "IBG.MC", "ISUR.MC", "LDA.MC",
+    "LGT.MC", "MCM.MC", "MDF.MC", "MVC.MC", "NEA.MC", "NTH.MC", "OHLA.MC",
+    "ORY.MC", "PRM.MC", "PRS.MC", "R4.MC", "REN.MC", "RLIA.MC", "TRE.MC",
+    "VOC.MC",
 ]
 
 # Valores extra que quieras añadir (mismo formato). Ejemplo: "CAF.MC"
@@ -102,6 +109,14 @@ TICKER_NAMES = {
     "GRE.MC": "Grenergy", "HOME.MC": "Neinor", "PSG.MC": "Prosegur", "RJF.MC": "Reig Jofre",
     "SOL.MC": "Soltec", "TLGO.MC": "Talgo", "TUB.MC": "Tubacex", "VID.MC": "Vidrala",
     "VIS.MC": "Viscofan", "ZOT.MC": "Zardoya Otis",
+    "ADZ.MC": "Adolfo Domínguez", "AMP.MC": "Amper", "ARM.MC": "Árima", "AZK.MC": "Azkoyen",
+    "CAF.MC": "CAF", "CBAV.MC": "Clínica Baviera", "CIRSA.MC": "Cirsa", "DIA.MC": "Dia",
+    "EDR.MC": "eDreams", "ENER.MC": "Ecoener", "GSJ.MC": "Grupo San José", "IBG.MC": "Iberpapel",
+    "ISUR.MC": "Inmobiliaria del Sur", "LDA.MC": "Línea Directa", "LGT.MC": "Lingotes Especiales",
+    "MCM.MC": "Miquel y Costas", "MDF.MC": "Duro Felguera", "MVC.MC": "Metrovacesa",
+    "NEA.MC": "Nicolás Correa", "NTH.MC": "Naturhouse", "OHLA.MC": "OHLA", "ORY.MC": "Oryzon",
+    "PRM.MC": "Prim", "PRS.MC": "Prisa", "R4.MC": "Renta 4", "REN.MC": "Renta Corporación",
+    "RLIA.MC": "Realia", "TRE.MC": "Técnicas Reunidas", "VOC.MC": "Vocento",
 }
 
 STATE_FILE = Path(__file__).with_name("state.json")
@@ -417,14 +432,29 @@ def _near_lines(r):
     return [html.escape(m) for m in motivos]
 
 
-def build_report(cumple, near, n_review, no_data=0):
+def _fit(lines, limit=3900):
+    """Une las líneas sin pasar del límite de Telegram, cortando siempre entre líneas."""
+    out, size = [], 0
+    for ln in lines:
+        if size + len(ln) + 1 > limit:
+            out.append("…")
+            break
+        out.append(ln)
+        size += len(ln) + 1
+    return "\n".join(out)
+
+
+def build_report(cumple, near, n_review, no_data=0, n_total=0, cumple_more=0):
+    cover = f" · {n_total} empresas revisadas" if n_total else ""
     L = [f"📉 <b>Calidad en caída · {date.today():%d/%m}</b>",
-         "<i>Caída desde el máximo de 12 meses</i>"]
+         f"<i>Caída desde el máximo de 12 meses{cover}</i>"]
     L += ["", f"✅ <b>CUMPLEN LAS PAUTAS</b>"]
     if cumple:
         for r in cumple:
             L.append(_head(r))
             L += [html.escape(x) for x in _cumple_lines(r)]
+        if cumple_more:
+            L.append(f"… y {cumple_more} más que cumplen")
     else:
         L.append("Ninguna hoy")
     if near:
@@ -434,7 +464,7 @@ def build_report(cumple, near, n_review, no_data=0):
             L += _near_lines(r)
     if no_data:
         L += ["", f"⚠️ Yahoo no dio datos de {no_data} de {n_review} valores; pueden faltar candidatas."]
-    return "\n".join(L)[:4000]
+    return _fit(L)
 
 
 def send(text):
@@ -521,6 +551,9 @@ def main():
         print(f"  {mark} {t} ({score:.2f}): {detail or 'pasa todas las pautas'}")
         rows.append({"kind": kind, "t": t, "stat": s, "f": f, "fails": fails, "nodata": nodata,
                      "score": score, "missing": missing_f, "extra": []})
+        if no_data >= 8 and no_data == len(rows):
+            print("[aviso] Yahoo no da datos de las 8 primeras: paro la revisión para no perder tiempo")
+            break
         time.sleep(0.4)
 
     state = load_state()
@@ -528,14 +561,16 @@ def main():
     if not REPEAT_ALERTS and not args.dry_run:
         cumple = [r for r in cumple if should_alert(r["t"], r["stat"]["drawdown"], state)]
     cumple.sort(key=lambda r: r["stat"]["drawdown"])
+    cumple_more = max(0, len(cumple) - MAX_CUMPLE)
+    cumple = cumple[:MAX_CUMPLE]
     near = sorted((r for r in rows if r["kind"] == "no" and not r["missing"]), key=lambda r: r["score"])[:TOP_NEAR]
 
     if SHOW_EXTRA:
         for r in cumple:
             r["extra"] = extras(r["t"], r["stat"], r["f"])
 
-    warn = no_data if (review and no_data * 2 >= len(review)) else 0
-    text = build_report(cumple, near, len(review), warn)
+    warn = no_data if (rows and no_data * 2 >= len(rows)) else 0
+    text = build_report(cumple, near, len(rows), warn, len(stats), cumple_more)
 
     if args.dry_run:
         print("\n" + text)
