@@ -68,7 +68,12 @@ MARKETS = {
 AUTO_SCHEDULE = {0: "es", 1: "eu", 2: "us"}
 MAX_CUMPLE = 10             # máximo de empresas que cumplen en el mensaje. Si hay 10 o más que cumplen,
                             # se muestran solo 10 y NO se listan las que no cumplen ni se dice cuántas hay más
-SHOW_EXTRA = True           # en los que cumplen: recompras y activo circulante neto
+DISCLAIMER = (
+    "<i>⚠️ Aviso: información automática con fines informativos; no es un consejo ni una recomendación "
+    "de inversión. Los datos pueden ser inexactos o estar desfasados y la rentabilidad pasada no garantiza "
+    "la futura. Haz tu propio análisis: cada uno es responsable de sus decisiones.</i>"
+)
+SHOW_EXTRA = True          # en los que cumplen: recompras y activo circulante neto
 REPEAT_ALERTS = True        # True = avisa cada ejecución aunque ya lo hubiera avisado antes
 REALERT_AFTER_DAYS = 30     # (solo si REPEAT_ALERTS = False) repite pasados estos días...
 REALERT_IF_WORSE_BY = 0.10  # ...o si ha caído 10 puntos más desde el último aviso
@@ -619,7 +624,8 @@ def build_report(cumple, near, n_review, no_data=0, n_total=0, market=""):
             L.append(_block(r, "🟡", _near_lines(r)))
     if no_data:
         L += ["", f"⚠️ Yahoo no dio datos de {no_data} de {n_review} valores; pueden faltar candidatas."]
-    return _fit(L)
+    # El aviso legal va siempre al final: se le reserva sitio para que ni el recorte por longitud lo quite
+    return _fit(L, 3900 - len(DISCLAIMER) - 2) + "\n\n" + DISCLAIMER
 
 
 def send(text):
