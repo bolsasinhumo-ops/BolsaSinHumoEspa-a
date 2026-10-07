@@ -66,7 +66,8 @@ MARKETS = {
 }
 # Qué mercado se ejecuta cada día (0 = lunes ... 6 = domingo; hora UTC). Máximo el miércoles.
 AUTO_SCHEDULE = {0: "es", 1: "eu", 2: "us"}
-MAX_CUMPLE = 10             # máximo de empresas que cumplen listadas en el mensaje (el resto: "y N más")
+MAX_CUMPLE = 10             # máximo de empresas que cumplen en el mensaje. Si hay 10 o más que cumplen,
+                            # se muestran solo 10 y NO se listan las que no cumplen ni se dice cuántas hay más
 SHOW_EXTRA = True           # en los que cumplen: recompras y activo circulante neto
 REPEAT_ALERTS = True        # True = avisa cada ejecución aunque ya lo hubiera avisado antes
 REALERT_AFTER_DAYS = 30     # (solo si REPEAT_ALERTS = False) repite pasados estos días...
@@ -329,6 +330,17 @@ def _pc(x, dec=1, signed=False):
     return f"{sign}{s}%"
 
 
+def _vs(x, lim, dec=0):
+    """Texto de un valor que NO llega al umbral (o lo supera), sin que el redondeo lo iguale a él.
+    Ej.: 29,7 frente a 30 -> "29,7" (y no "30"); 25,04 frente a 25 -> "25,0" -> "25,04"."""
+    d = dec
+    s = f"{x:.{d}f}"
+    while abs(float(s) - lim) < 1e-9 and d < dec + 4:
+        d += 1
+        s = f"{x:.{d}f}"
+    return s.replace(".", ",").replace("-", "−")
+
+
 def _sym(cur):
     return {"EUR": "€", "USD": "$", "GBP": "£"}.get(cur or "", cur or "")
 
@@ -356,6 +368,7 @@ def _name(t, f):
         if new == raw or not new:
             break
         raw = new
+    raw = raw.rstrip(" &,") or raw  # "KKR & Co." -> "KKR"
     if raw.isupper() and " " in raw:  # "BNP PARIBAS" -> "Bnp Paribas"; siglas sueltas (SAP, ASML) se dejan
         raw = raw.title()
     return raw if len(raw) <= 22 else raw[:21].rstrip() + "…"
@@ -384,14 +397,15 @@ def checks(stat, f, rules=None):
         out.append(("ok", "", 0.0))
     else:
         gap = (rules["min_drawdown"] - abs(dd)) / rules["min_drawdown"]
-        out.append(("fail", f"Caída {_pc(abs(dd), 0)} (pide {_pc(rules['min_drawdown'], 0)})", cap(gap)))
+        shown = _vs(abs(dd) * 100, rules["min_drawdown"] * 100, 0)
+        out.append(("fail", f"Caída {shown}% (pide {_pc(rules['min_drawdown'], 0)})", cap(gap)))
 
     net = _num(f, "profitMargins")
     lim = rules["min_net_margin"]
     if net is None:
         out.append(("nodata", "margen neto", 0.5))
     elif net < lim:
-        out.append(("fail", f"Margen neto {_pc(net)} (pide {_pc(lim, 0)})", cap((lim - net) / lim)))
+        out.append(("fail", f"Margen neto {_vs(net * 100, lim * 100, 1)}% (pide {_pc(lim, 0)})", cap((lim - net) / lim)))
     else:
         out.append(("ok", "", 0.0))
 
@@ -401,7 +415,7 @@ def checks(stat, f, rules=None):
         if op is None:
             out.append(("nodata", "margen operativo", 0.5))
         elif op < lim:
-            out.append(("fail", f"Margen operativo {_pc(op)} (pide {_pc(lim, 0)})", cap((lim - op) / lim)))
+            out.append(("fail", f"Margen operativo {_vs(op * 100, lim * 100, 1)}% (pide {_pc(lim, 0)})", cap((lim - op) / lim)))
         else:
             out.append(("ok", "", 0.0))
 
@@ -417,13 +431,13 @@ def checks(stat, f, rules=None):
     rev = _num(f, "revenueGrowth")
     lim = rules["min_revenue_growth"]
     if rev is not None and rev < lim:
-        out.append(("fail", f"Ingresos {_pc(rev, 1, True)} (pide {_pc(lim, 0)})", cap((lim - rev) / abs(lim))))
+        out.append(("fail", f"Ingresos {_vs(rev * 100, lim * 100, 1)}% (pide {_pc(lim, 0)})", cap((lim - rev) / abs(lim))))
 
     if "max_debt_to_equity" in rules:
         de = _num(f, "debtToEquity")
         lim = rules["max_debt_to_equity"]
         if de is not None and de > lim:
-            out.append(("fail", f"Deuda/capital {de:.0f}% (máx {lim:.0f}%)", cap((de - lim) / lim)))
+            out.append(("fail", f"Deuda/capital {_vs(de, lim, 0)}% (máx {lim:.0f}%)", cap((de - lim) / lim)))
 
     fpe = _num(f, "forwardPE")
     lim = rules["max_forward_pe"]
@@ -431,7 +445,7 @@ def checks(stat, f, rules=None):
         if fpe <= 0:
             out.append(("fail", "PER a futuro negativo", 1.0))
         elif fpe > lim:
-            out.append(("fail", f"PER {_n(fpe)} (máx {lim:.0f})", cap((fpe - lim) / lim)))
+            out.append(("fail", f"PER {_vs(fpe, lim, 1)} (máx {lim:.0f})", cap((fpe - lim) / lim)))
 
     if rules["min_rebound_from_20d_low"] > 0 and stat["rebound20"] < rules["min_rebound_from_20d_low"]:
         out.append(("fail", "Aún sin rebote desde mínimos", 0.5))
@@ -523,18 +537,30 @@ def extras(t, stat, f):
 # ----------------------------------------------------------------------------
 # Mensaje
 # ----------------------------------------------------------------------------
-def _head(r):
-    t, s, f = r["t"], r["stat"], r["f"]
-    short = html.escape(_tk(t))
+def _dd_text(r):
+    """Caída para mostrar: si no llega al umbral, con los decimales necesarios para que no parezca que sí llega."""
+    dd = abs(r["stat"]["drawdown"]) * 100
+    lim = RULES["min_drawdown"] * 100
+    return (_vs(dd, lim, 0) if dd < lim else f"{dd:.0f}") + "%"
+
+
+def _head(r, icon):
+    t, f = r["t"], r["f"]
     yahoo = f'<a href="https://finance.yahoo.com/quote/{html.escape(t)}">Yahoo</a>'
     name = _name(t, f)
-    label = f"<b>{html.escape(name)}</b>" + ("" if name.upper() == _tk(t) else f" ({short})")
-    return f"• {label} · cae {abs(s['drawdown']) * 100:.0f}% · {yahoo}"
+    label = f"<b>{html.escape(name)}</b>" + ("" if name.upper() == _tk(t) else f" ({html.escape(_tk(t))})")
+    return f"{icon} {label} · {yahoo}"
+
+
+def _block(r, icon, lines):
+    """Una empresa: cabecera con icono + sus datos en un bloque de cita (barra a la izquierda) con viñetas."""
+    body = "\n".join("• " + x for x in lines)
+    return f"{_head(r, icon)}\n<blockquote>{body}</blockquote>"
 
 
 def _cumple_lines(r):
     f = r["f"]
-    L = []
+    L = [f"Cae {_dd_text(r)}"]
     per = _num(f, "trailingPE")
     if per is None or per <= 0:
         per = _num(f, "forwardPE")
@@ -543,52 +569,54 @@ def _cumple_lines(r):
         bits.append(f"PER {_n(per)} (rentabilidad {100 / per:.0f}%)")
     pb = _num(f, "priceToBook")
     if pb is not None:
-        bits.append(f"valor contable {_n(pb, 2)}x")
+        bits.append("valor contable negativo" if pb <= 0 else f"valor contable {_n(pb, 2)}x")
     if bits:
-        L.append("↳ " + " · ".join(bits))
-    for e in r.get("extra", []):
-        L.append("↳ " + e)
-    return L
+        L.append(" · ".join(bits))
+    L += r.get("extra", [])
+    return [html.escape(x) for x in L]
 
 
 def _near_lines(r):
     motivos = [f"❌ {t}" for t in r["fails"]] + [f"❔ Sin dato de {x}" for x in r["nodata"]]
     if len(motivos) > 3:
         motivos = motivos[:3] + [f"❌ y {len(motivos) - 3} más"]
+    if not any(t.startswith("Caída") for t in r["fails"]):
+        motivos.insert(0, f"Cae {_dd_text(r)}")
     return [html.escape(m) for m in motivos]
 
 
-def _fit(lines, limit=3900):
-    """Une las líneas sin pasar del límite de Telegram, cortando siempre entre líneas."""
+def _fit(parts, limit=3900):
+    """Une los bloques sin pasar del límite de Telegram, cortando siempre entre bloques
+    (así nunca queda una etiqueta HTML a medias)."""
     out, size = [], 0
-    for ln in lines:
-        if size + len(ln) + 1 > limit:
+    for p in parts:
+        if size + len(p) + 1 > limit:
             out.append("…")
             break
-        out.append(ln)
-        size += len(ln) + 1
+        out.append(p)
+        size += len(p) + 1
     return "\n".join(out)
 
 
-def build_report(cumple, near, n_review, no_data=0, n_total=0, cumple_more=0, market=""):
+def build_report(cumple, near, n_review, no_data=0, n_total=0, market=""):
     cover = f" · {n_total} empresas revisadas" if n_total else ""
     where = f" · {market}" if market else ""
     L = [f"📉 <b>Calidad en caída{where} · {date.today():%d/%m}</b>",
-         f"<i>Caída desde el máximo de 12 meses{cover}</i>"]
-    L += ["", f"✅ <b>CUMPLEN LAS PAUTAS</b>"]
+         f"<i>Caída desde el máximo de 12 meses{cover}</i>",
+         "", "✅ <b>CUMPLEN LAS PAUTAS</b>", ""]
     if cumple:
-        for r in cumple:
-            L.append(_head(r))
-            L += [html.escape(x) for x in _cumple_lines(r)]
-        if cumple_more:
-            L.append(f"… y {cumple_more} más que cumplen")
+        for i, r in enumerate(cumple):
+            if i:
+                L.append("")
+            L.append(_block(r, "🟢", _cumple_lines(r)))
     else:
         L.append("Ninguna hoy")
     if near:
-        L += ["", f"🟡 <b>NO CUMPLEN, PERO ESTÁN CERCA</b>"]
-        for r in near:
-            L.append(_head(r))
-            L += _near_lines(r)
+        L += ["", "🟡 <b>NO CUMPLEN, PERO ESTÁN CERCA</b>", ""]
+        for i, r in enumerate(near):
+            if i:
+                L.append("")
+            L.append(_block(r, "🟡", _near_lines(r)))
     if no_data:
         L += ["", f"⚠️ Yahoo no dio datos de {no_data} de {n_review} valores; pueden faltar candidatas."]
     return _fit(L)
@@ -708,16 +736,18 @@ def main():
     if not REPEAT_ALERTS and not args.dry_run:
         cumple = [r for r in cumple if should_alert(r["t"], r["stat"]["drawdown"], state)]
     cumple.sort(key=lambda r: r["stat"]["drawdown"])
-    cumple_more = max(0, len(cumple) - MAX_CUMPLE)
+    many = len(cumple) >= MAX_CUMPLE          # hay de sobra: solo se muestran 10, sin "casi" ni "y N más"
     cumple = cumple[:MAX_CUMPLE]
-    near = sorted((r for r in rows if r["kind"] == "no" and not r["missing"]), key=lambda r: r["score"])[:TOP_NEAR]
+    near = [] if many else sorted(
+        (r for r in rows if r["kind"] == "no" and not r["missing"]), key=lambda r: r["score"]
+    )[:TOP_NEAR]
 
     if SHOW_EXTRA:
         for r in cumple:
             r["extra"] = extras(r["t"], r["stat"], r["f"])
 
     warn = no_data if (rows and no_data * 2 >= len(rows)) else 0
-    text = build_report(cumple, near, len(rows), warn, len(stats), cumple_more,
+    text = build_report(cumple, near, len(rows), warn, len(stats),
                         market=cfg["name"] if not custom else "")
 
     if args.dry_run:
