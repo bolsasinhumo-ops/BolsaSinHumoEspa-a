@@ -352,6 +352,8 @@ def _sym(cur):
 
 def _m(v, cur=""):
     sym = _sym(cur)
+    if abs(v) < 1e6:
+        return f"{v / 1e3:.0f}k{sym}"
     if abs(v) >= 1e9:
         return f"{v / 1e6:,.0f}".replace(",", ".") + f"M{sym}"
     return f"{v / 1e6:.0f}M{sym}"
@@ -474,7 +476,7 @@ def evaluate(stat, f, rules=None):
 
 
 # ----------------------------------------------------------------------------
-# Extras para los que cumplen: recompras y activo circulante neto por acción
+# Recompras y activo circulante neto por acción
 # ----------------------------------------------------------------------------
 def _series(df, *names):
     """Fila de un estado financiero de yfinance, de más reciente a más antigua."""
@@ -505,26 +507,28 @@ def _fetch_statements(ticker):
 
 
 def extras(t, stat, f):
-    """Lista de líneas cortas (recompras y activo circulante neto). [] si no hay nada."""
+    """Recompras y activo circulante neto, a partir de los estados financieros de Yahoo.
+    Devuelve un dict; lo que no se pueda calcular queda en None."""
+    out = {"rep": None, "rep_cur": "", "shares_chg": None, "ncav": None, "ncav_cur": ""}
     try:
         st = _fetch_statements(t)
     except Exception:
-        return []
+        return out
     cur = f.get("currency") or ""
     fcur = f.get("financialCurrency") or cur
     same_cur = (fcur == cur) or not cur
-    lines = []
 
-    rep = _series(st["cf_y"], "Repurchase Of Capital Stock", "Common Stock Payments")
+    cf = st["cf_y"]
+    cf_ok = cf is not None and not getattr(cf, "empty", True)
+    out["rep_cur"] = fcur
+    rep = _series(cf, "Repurchase Of Capital Stock", "Common Stock Payments")
     if rep is not None:
-        amount = abs(float(rep.iloc[0]))
-        if amount > 0:
-            txt = f"Recompras: {_m(amount, fcur)}"
-            shares = _series(st["bs_y"], "Ordinary Shares Number", "Share Issued")
-            if shares is not None and len(shares) >= 2 and float(shares.iloc[1]) > 0:
-                chg = float(shares.iloc[0]) / float(shares.iloc[1]) - 1
-                txt += " (acciones sin cambio)" if abs(chg) < 0.005 else f" (acciones {_pc(chg, 1, True)})"
-            lines.append(txt)
+        out["rep"] = abs(float(rep.iloc[0]))
+        shares = _series(st["bs_y"], "Ordinary Shares Number", "Share Issued")
+        if shares is not None and len(shares) >= 2 and float(shares.iloc[1]) > 0:
+            out["shares_chg"] = float(shares.iloc[0]) / float(shares.iloc[1]) - 1
+    elif cf_ok:
+        out["rep"] = 0.0  # hay flujo de caja pero sin partida de recompras: no ha recomprado
 
     if not is_financial(f) and same_cur:
         has_q = _series(st["bs_q"], "Current Assets", "Stockholders Equity", "Common Stock Equity") is not None
@@ -533,15 +537,96 @@ def extras(t, stat, f):
         tl = _latest(bs, "Total Liabilities Net Minority Interest", "Total Liabilities")
         sh = _latest(bs, "Ordinary Shares Number", "Share Issued") or _num(f, "sharesOutstanding")
         if ca is not None and tl is not None and sh:
-            ncav = (ca - tl) / sh
-            if ncav > 0:
-                lines.append(f"Activo circulante neto: {_n(ncav, 2)}{_sym(cur)} por acción")
-    return lines
+            out["ncav"] = (ca - tl) / sh
+            out["ncav_cur"] = cur
+    return out
+
+
+# ----------------------------------------------------------------------------
+# Los 5 datos del análisis (PER por sector, rentabilidad, valor contable, recompras, activo circulante neto)
+# ----------------------------------------------------------------------------
+def sector_pe(f):
+    """(etiqueta, PER máximo) según el sector: cíclicas < 5, tecnología/software/consultoría < 20, resto < 10."""
+    sector = f.get("sector") or ""
+    ind = (f.get("industry") or "").lower()
+    if re.search(r"\bauto\b", ind) or sector == "Energy" or "airline" in ind:
+        return "cíclica", 5
+    if sector == "Technology" or "consulting" in ind or "software" in ind or "information technology" in ind:
+        return "tecnología", 20
+    return "resto", 10
+
+
+def analysis(r):
+    """Lista de (icono, texto): ✅ cumple · ❌ no cumple · ➖ no aplica · ❔ sin dato."""
+    f, ex, s = r["f"], r.get("extra") or {}, r["stat"]
+    L = []
+
+    # 1 y 2. PER según sector y rentabilidad implícita (1/PER)
+    label, lim = sector_pe(f)
+    thr = 100 / lim
+    per = _num(f, "trailingPE")
+    if per is None or per <= 0:
+        per = _num(f, "forwardPE")
+    if per is None:
+        L += [("❔", "PER sin dato"), ("❔", "Rentabilidad sin dato")]
+    elif per <= 0:
+        L += [("❌", f"PER negativo (pide <{lim}, {label})"), ("❌", f"Rentabilidad negativa (pide >{thr:g}%)")]
+    else:
+        mark = "✅" if per < lim else "❌"
+        L += [(mark, f"PER {_vs(per, lim, 1)} (pide <{lim}, {label})"),
+              (mark, f"Rentabilidad {_vs(100 / per, thr, 1)}% (pide >{thr:g}%)")]
+
+    # 3. Valor contable: capitalización frente a patrimonio neto
+    pb = _num(f, "priceToBook")
+    if pb is None:
+        L.append(("❔", "Valor contable sin dato"))
+    elif pb <= 0:
+        L.append(("❌", "Valor contable negativo"))
+    else:
+        L.append(("✅" if pb < 1 else "❌", f"Valor contable {_vs(pb, 1, 2)}x (pide <1x)"))
+
+    # 4. Recompras de acciones
+    rep = ex.get("rep")
+    if rep is None:
+        L.append(("❔", "Recompras sin dato"))
+    elif rep <= 0:
+        L.append(("❌", "Sin recompras"))
+    else:
+        amount = _m(rep, ex.get("rep_cur", ""))
+        chg = ex.get("shares_chg")
+        if chg is None:
+            L.append(("✅", f"Recompras {amount}"))
+        elif chg > 0.005:
+            L.append(("❌", f"Recompras {amount}, pero acciones {_pc(chg, 1, True)}"))
+        else:
+            tail = "acciones sin cambio" if abs(chg) < 0.005 else f"acciones {_pc(chg, 1, True)}"
+            L.append(("✅", f"Recompras {amount} ({tail})"))
+
+    # 5. Activo circulante neto por acción (Graham): cumple si el precio es menor
+    if is_financial(f):
+        L.append(("➖", "Activo circulante neto: no aplica a bancos"))
+    else:
+        ncav = ex.get("ncav")
+        if ncav is None:
+            L.append(("❔", "Activo circulante neto sin dato"))
+        else:
+            sym = _sym(ex.get("ncav_cur", ""))
+            px = f"{_n(s['last'], 2)}{sym}"
+            if ncav <= 0:
+                L.append(("❌", f"Activo circulante neto negativo (precio {px})"))
+            else:
+                L.append(("✅" if s["last"] < ncav else "❌",
+                          f"Activo circulante neto {_n(ncav, 2)}{sym}/acc. (precio {px})"))
+    return L
 
 
 # ----------------------------------------------------------------------------
 # Mensaje
 # ----------------------------------------------------------------------------
+def _drop_fails(r):
+    return abs(r["stat"]["drawdown"]) * 100 < RULES["min_drawdown"] * 100
+
+
 def _dd_text(r):
     """Caída para mostrar: si no llega al umbral, con los decimales necesarios para que no parezca que sí llega."""
     dd = abs(r["stat"]["drawdown"]) * 100
@@ -551,81 +636,72 @@ def _dd_text(r):
 
 def _head(r, icon):
     t, f = r["t"], r["f"]
-    yahoo = f'<a href="https://finance.yahoo.com/quote/{html.escape(t)}">Yahoo</a>'
     name = _name(t, f)
     label = f"<b>{html.escape(name)}</b>" + ("" if name.upper() == _tk(t) else f" ({html.escape(_tk(t))})")
-    return f"{icon} {label} · {yahoo}"
+    return f"{icon} {label}"
 
 
-def _block(r, icon, lines):
-    """Una empresa: cabecera con icono + sus datos en un bloque de cita (barra a la izquierda) con viñetas."""
-    body = "\n".join("• " + x for x in lines)
-    return f"{_head(r, icon)}\n<blockquote>{body}</blockquote>"
+def _drop_line(r):
+    yahoo = f'<a href="https://finance.yahoo.com/quote/{html.escape(r["t"])}">Yahoo</a>'
+    if _drop_fails(r):
+        return f"⛔ Cae {_dd_text(r)} (pide {RULES['min_drawdown'] * 100:.0f}%) · {yahoo}"
+    return f"📉 Cae {_dd_text(r)} · {yahoo}"
 
 
-def _cumple_lines(r):
-    f = r["f"]
-    L = [f"Cae {_dd_text(r)}"]
-    per = _num(f, "trailingPE")
-    if per is None or per <= 0:
-        per = _num(f, "forwardPE")
-    bits = []
-    if per and per > 0:
-        bits.append(f"PER {_n(per)} (rentabilidad {100 / per:.0f}%)")
-    pb = _num(f, "priceToBook")
-    if pb is not None:
-        bits.append("valor contable negativo" if pb <= 0 else f"valor contable {_n(pb, 2)}x")
-    if bits:
-        L.append(" · ".join(bits))
-    L += r.get("extra", [])
-    return [html.escape(x) for x in L]
+def _block(r, icon, near=False):
+    """Una empresa: cabecera con icono y, en un bloque de cita (barra a la izquierda), sus datos.
+    Si no cumple las pautas, primero va lo que falla (⛔); después siempre los 5 datos con ✅/❌."""
+    lines = [_drop_line(r)]
+    if near:
+        why = [f"⛔ {t}" for t in r["fails"] if not t.startswith("Caída")]
+        why += [f"❔ Sin dato de {x}" for x in r["nodata"]]
+        if len(why) > 3:
+            why = why[:3] + [f"⛔ y {len(why) - 3} más"]
+        lines += [html.escape(w) for w in why]
+    lines += [f"{mark} {html.escape(txt)}" for mark, txt in analysis(r)]
+    return f"{_head(r, icon)}\n<blockquote>" + "\n".join(lines) + "</blockquote>"
 
 
-def _near_lines(r):
-    motivos = [f"❌ {t}" for t in r["fails"]] + [f"❔ Sin dato de {x}" for x in r["nodata"]]
-    if len(motivos) > 3:
-        motivos = motivos[:3] + [f"❌ y {len(motivos) - 3} más"]
-    if not any(t.startswith("Caída") for t in r["fails"]):
-        motivos.insert(0, f"Cae {_dd_text(r)}")
-    return [html.escape(m) for m in motivos]
-
-
-def _fit(parts, limit=3900):
-    """Une los bloques sin pasar del límite de Telegram, cortando siempre entre bloques
-    (así nunca queda una etiqueta HTML a medias)."""
-    out, size = [], 0
-    for p in parts:
-        if size + len(p) + 1 > limit:
-            out.append("…")
-            break
-        out.append(p)
-        size += len(p) + 1
-    return "\n".join(out)
-
-
-def build_report(cumple, near, n_review, no_data=0, n_total=0, market=""):
+def build_reports(cumple, near, n_review, no_data=0, n_total=0, market="", limit=3900):
+    """Devuelve una lista de mensajes (cada uno cabe en Telegram). Nunca corta una empresa por la mitad
+    y el aviso legal va siempre al final del último."""
     cover = f" · {n_total} empresas revisadas" if n_total else ""
     where = f" · {market}" if market else ""
-    L = [f"📉 <b>Calidad en caída{where} · {date.today():%d/%m}</b>",
-         f"<i>Caída desde el máximo de 12 meses{cover}</i>",
-         "", "✅ <b>CUMPLEN LAS PAUTAS</b>", ""]
+    head = "\n".join([f"📉 <b>Calidad en caída{where} · {date.today():%d/%m}</b>",
+                      f"<i>Caída desde el máximo de 12 meses{cover}</i>",
+                      "", "✅ <b>CUMPLEN LAS PAUTAS</b>", ""])
+    parts = []
     if cumple:
-        for i, r in enumerate(cumple):
-            if i:
-                L.append("")
-            L.append(_block(r, "🟢", _cumple_lines(r)))
+        parts.append(head + "\n" + _block(cumple[0], "🟢"))
+        for r in cumple[1:]:
+            parts += ["", _block(r, "🟢")]
     else:
-        L.append("Ninguna hoy")
+        parts.append(head + "\nNinguna hoy")
     if near:
-        L += ["", "🟡 <b>NO CUMPLEN, PERO ESTÁN CERCA</b>", ""]
-        for i, r in enumerate(near):
-            if i:
-                L.append("")
-            L.append(_block(r, "🟡", _near_lines(r)))
+        parts += ["", "🟡 <b>NO CUMPLEN, PERO ESTÁN CERCA</b>\n\n" + _block(near[0], "🟡", near=True)]
+        for r in near[1:]:
+            parts += ["", _block(r, "🟡", near=True)]
     if no_data:
-        L += ["", f"⚠️ Yahoo no dio datos de {no_data} de {n_review} valores; pueden faltar candidatas."]
-    # El aviso legal va siempre al final: se le reserva sitio para que ni el recorte por longitud lo quite
-    return _fit(L, 3900 - len(DISCLAIMER) - 2) + "\n\n" + DISCLAIMER
+        parts += ["", f"⚠️ Yahoo no dio datos de {no_data} de {n_review} valores; pueden faltar candidatas."]
+
+    msgs, cur, size = [], [], 0
+    for p in parts:
+        if not cur and p == "":
+            continue
+        if cur and size + len(p) + 1 > limit:
+            msgs.append("\n".join(cur).rstrip())
+            cur, size = [], 0
+            if p == "":
+                continue
+        cur.append(p)
+        size += len(p) + 1
+    if cur:
+        msgs.append("\n".join(cur).rstrip())
+    if len(msgs[-1]) + 2 + len(DISCLAIMER) <= 4000:
+        msgs[-1] += "\n\n" + DISCLAIMER
+    else:
+        msgs.append(DISCLAIMER)
+    return msgs
 
 
 def send(text):
@@ -748,19 +824,23 @@ def main():
         (r for r in rows if r["kind"] == "no" and not r["missing"]), key=lambda r: r["score"]
     )[:TOP_NEAR]
 
-    if SHOW_EXTRA:
-        for r in cumple:
+    if SHOW_EXTRA:  # recompras y activo circulante neto: para todas las que salen en el mensaje
+        for r in cumple + near:
             r["extra"] = extras(r["t"], r["stat"], r["f"])
+            time.sleep(0.3)
 
     warn = no_data if (rows and no_data * 2 >= len(rows)) else 0
-    text = build_report(cumple, near, len(rows), warn, len(stats),
-                        market=cfg["name"] if not custom else "")
+    texts = build_reports(cumple, near, len(rows), warn, len(stats),
+                          market=cfg["name"] if not custom else "")
 
     if args.dry_run:
-        print("\n" + text)
+        print("\n" + "\n\n=== siguiente mensaje ===\n\n".join(texts))
         return
 
-    send(text)
+    for i, text in enumerate(texts):
+        if i:
+            time.sleep(1.5)  # varios mensajes seguidos: pausa para no topar con el límite de Telegram
+        send(text)
     for r in cumple:
         state[r["t"]] = {"date": date.today().isoformat(), "drawdown": r["stat"]["drawdown"]}
     save_state(state)
