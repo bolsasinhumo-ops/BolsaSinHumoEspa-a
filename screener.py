@@ -57,6 +57,11 @@ RULES_FINANCIALS = {
 }
 
 TOP_NEAR = 5                # cuántas "que no cumplen pero están cerca" se muestran
+NEAR_POOL = 15              # de las que no pasan los filtros, cuántas se analizan a fondo para elegir las más cercanas
+# Para CUMPLIR hay que pasar los filtros de calidad (caída, beneficios, deuda...) Y tener al menos
+# MIN_ANALYSIS_OK de los 5 datos del análisis (PER, rentabilidad, valor contable, recompras, activo
+# circulante neto) en ✅. Así nunca sale como "cumple" una empresa con casi todo en ❌.
+MIN_ANALYSIS_OK = 3
 # Ajustes por mercado. En cada uno solo se revisan los fundamentales de las empresas que han
 # caído al menos "review_min_drawdown", y como mucho las "max_review" que más han caído.
 MARKETS = {
@@ -73,7 +78,6 @@ DISCLAIMER = (
     "de inversión. Los datos pueden ser inexactos o estar desfasados y la rentabilidad pasada no garantiza "
     "la futura. Haz tu propio análisis: cada uno es responsable de sus decisiones.</i>"
 )
-SHOW_EXTRA = True          # en los que cumplen: recompras y activo circulante neto
 REPEAT_ALERTS = True        # True = avisa cada ejecución aunque ya lo hubiera avisado antes
 REALERT_AFTER_DAYS = 30     # (solo si REPEAT_ALERTS = False) repite pasados estos días...
 REALERT_IF_WORSE_BY = 0.10  # ...o si ha caído 10 puntos más desde el último aviso
@@ -620,6 +624,11 @@ def analysis(r):
     return L
 
 
+def analysis_count(an):
+    """(datos en ✅, datos que aplican). El ➖ (no aplica) no cuenta como dato."""
+    return sum(1 for m, _ in an if m == "✅"), sum(1 for m, _ in an if m != "➖")
+
+
 # ----------------------------------------------------------------------------
 # Mensaje
 # ----------------------------------------------------------------------------
@@ -638,7 +647,8 @@ def _head(r, icon):
     t, f = r["t"], r["f"]
     name = _name(t, f)
     label = f"<b>{html.escape(name)}</b>" + ("" if name.upper() == _tk(t) else f" ({html.escape(_tk(t))})")
-    return f"{icon} {label}"
+    ok, app = analysis_count(r.get("an") or analysis(r))
+    return f"{icon} {label} · {ok}/{app} ✅"
 
 
 def _drop_line(r):
@@ -658,7 +668,7 @@ def _block(r, icon, near=False):
         if len(why) > 3:
             why = why[:3] + [f"⛔ y {len(why) - 3} más"]
         lines += [html.escape(w) for w in why]
-    lines += [f"{mark} {html.escape(txt)}" for mark, txt in analysis(r)]
+    lines += [f"{mark} {html.escape(txt)}" for mark, txt in (r.get("an") or analysis(r))]
     return f"{_head(r, icon)}\n<blockquote>" + "\n".join(lines) + "</blockquote>"
 
 
@@ -669,6 +679,7 @@ def build_reports(cumple, near, n_review, no_data=0, n_total=0, market="", limit
     where = f" · {market}" if market else ""
     head = "\n".join([f"📉 <b>Calidad en caída{where} · {date.today():%d/%m}</b>",
                       f"<i>Caída desde el máximo de 12 meses{cover}</i>",
+                      f"<i>Cumplen: filtros de calidad y al menos {MIN_ANALYSIS_OK} de los 5 datos en ✅</i>",
                       "", "✅ <b>CUMPLEN LAS PAUTAS</b>", ""])
     parts = []
     if cumple:
@@ -814,20 +825,36 @@ def main():
         time.sleep(0.4)
 
     state = load_state()
-    cumple = [r for r in rows if r["kind"] == "cumple"]
+    gate_ok = [r for r in rows if r["kind"] == "cumple"]          # pasan los filtros de calidad
     if not REPEAT_ALERTS and not args.dry_run:
-        cumple = [r for r in cumple if should_alert(r["t"], r["stat"]["drawdown"], state)]
-    cumple.sort(key=lambda r: r["stat"]["drawdown"])
-    many = len(cumple) >= MAX_CUMPLE          # hay de sobra: solo se muestran 10, sin "casi" ni "y N más"
-    cumple = cumple[:MAX_CUMPLE]
-    near = [] if many else sorted(
-        (r for r in rows if r["kind"] == "no" and not r["missing"]), key=lambda r: r["score"]
-    )[:TOP_NEAR]
+        gate_ok = [r for r in gate_ok if should_alert(r["t"], r["stat"]["drawdown"], state)]
+    gate_ok.sort(key=lambda r: r["stat"]["drawdown"])
+    gate_no = sorted((r for r in rows if r["kind"] == "no" and not r["missing"]),
+                     key=lambda r: r["score"])[:NEAR_POOL]        # candidatas a "cerca"
 
-    if SHOW_EXTRA:  # recompras y activo circulante neto: para todas las que salen en el mensaje
-        for r in cumple + near:
-            r["extra"] = extras(r["t"], r["stat"], r["f"])
-            time.sleep(0.3)
+    def enrich(r):
+        """Recompras y activo circulante neto, y los 5 datos con su ✅/❌."""
+        r["extra"] = extras(r["t"], r["stat"], r["f"])
+        r["an"] = analysis(r)
+        r["n_ok"], r["n_app"] = analysis_count(r["an"])
+        time.sleep(0.3)
+
+    cumple, short = [], []   # cumple = filtros + al menos MIN_ANALYSIS_OK datos en ✅
+    for r in gate_ok:
+        enrich(r)
+        (cumple if r["n_ok"] >= MIN_ANALYSIS_OK else short).append(r)
+        if len(cumple) >= MAX_CUMPLE:
+            break
+    many = len(cumple) >= MAX_CUMPLE          # hay de sobra: solo 10, sin "cerca" ni "y N más"
+    near = []
+    if not many:
+        for r in gate_no:
+            enrich(r)
+        pool = short + gate_no
+        for r in pool:   # cuanto más baja, más cerca de cumplir
+            r["total"] = r["score"] + 0.2 * max(0, MIN_ANALYSIS_OK - r["n_ok"])
+        near = sorted(pool, key=lambda r: r["total"])[:TOP_NEAR]
+    print(f"Cumplen: {len(cumple)} | pasan filtros pero con pocos ✅: {len(short)} | candidatas a 'cerca': {len(gate_no)}")
 
     warn = no_data if (rows and no_data * 2 >= len(rows)) else 0
     texts = build_reports(cumple, near, len(rows), warn, len(stats),
