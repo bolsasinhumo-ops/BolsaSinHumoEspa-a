@@ -2,15 +2,31 @@ name: Screener bolsa
 
 on:
   schedule:
-    - cron: "0 6 * * 1"
-  workflow_dispatch:
+    # Lunes, martes y miércoles a las 06:00 UTC (08:00 en Madrid con horario de verano, 07:00 con el de invierno).
+    # El propio script elige el mercado según el día: lunes España, martes Europa, miércoles EE. UU.
+    - cron: "0 6 * * 1,2,3"
+  workflow_dispatch:         # lanzarlo a mano desde la pestaña Actions
+    inputs:
+      market:
+        description: "Mercado a revisar"
+        type: choice
+        default: es
+        options:
+          - es
+          - eu
+          - us
 
 permissions:
-  contents: write
+  contents: write            # para guardar state.json (historial de avisos)
+
+concurrency:
+  group: screener            # nunca dos lanzamientos a la vez
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
 
@@ -19,17 +35,25 @@ jobs:
           python-version: "3.12"
 
       - name: Instalar dependencias
-        run: pip install yfinance pandas requests
+        run: pip install yfinance pandas requests lxml
 
-      - name: Ejecutar screener
-        run: python screener.py
+      - name: Ejecutar screener (si Yahoo falla, reintenta solo hasta 3 veces)
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MARKET: ${{ github.event.inputs.market || 'auto' }}
+        run: |
+          for i in 1 2 3; do
+            python screener.py --market "$MARKET" && exit 0
+            echo "Intento $i fallido; espero 5 minutos y reintento"
+            sleep 300
+          done
+          exit 1
 
       - name: Guardar historial de avisos
+        if: success()
         run: |
           git config user.name "screener-bot"
           git config user.email "screener-bot@users.noreply.github.com"
           git add state.json
-          git diff --cached --quiet || (git commit -m "Actualiza historial de avisos" && git push)
+          git diff --cached --quiet || (git commit -m "Actualiza historial de avisos" && git push) || echo "No se pudo guardar el historial (no afecta al mensaje)"
